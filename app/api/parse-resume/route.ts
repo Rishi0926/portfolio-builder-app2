@@ -6,30 +6,36 @@ const groq = createGroq({
   apiKey: process.env.GROQ_API_KEY || "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",
 })
 
-// Multiple PDF extraction approaches
+// Enhanced PDF extraction with better error handling
 async function extractTextFromPDF(buffer: Buffer): Promise<string> {
   let extractedText = ""
   let errors: string[] = []
 
   console.log("🔍 Starting PDF text extraction...")
 
-  // Method 1: pdf-parse (most reliable)
+  // Method 1: pdf-parse with better configuration
   try {
     console.log("📋 Attempting pdf-parse extraction...")
     const pdfParse = await import("pdf-parse")
-    const data = await pdfParse.default(buffer)
+    
+    const options = {
+      normalizeWhitespace: false,
+      disableCombineTextItems: false,
+      max: 0, // Parse all pages
+    }
+    
+    const data = await pdfParse.default(buffer, options)
     
     console.log("📋 pdf-parse raw data:", {
       textLength: data.text?.length || 0,
       hasText: !!data.text,
-      textPreview: data.text?.substring(0, 200) || "No text"
+      numPages: data.numpages || 0,
+      textPreview: data.text?.substring(0, 300) || "No text"
     })
     
-    if (data.text && data.text.trim().length > 50) {
+    if (data.text && data.text.trim().length > 20) {
       extractedText = data.text.trim()
       console.log("✅ pdf-parse successful!")
-      console.log("📝 Extracted text length:", extractedText.length)
-      console.log("📝 Text preview:", extractedText.substring(0, 500))
       return cleanExtractedText(extractedText)
     }
     errors.push("pdf-parse: insufficient text extracted")
@@ -38,16 +44,16 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
     console.error("❌ pdf-parse failed:", error)
   }
 
-  // Method 2: pdf2json fallback
+  // Method 2: pdf2json with improved parsing
   try {
     console.log("📋 Attempting pdf2json extraction...")
     const PDFParser = (await import("pdf2json")).default
-    const parser = new PDFParser(null, true) // Enable raw text mode
+    const parser = new PDFParser(null, true)
     
     const parsed = await new Promise<string>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         reject(new Error("PDF parsing timeout"))
-      }, 15000) // 15 second timeout
+      }, 30000) // Increased timeout
 
       parser.on("pdfParser_dataError", (error) => {
         clearTimeout(timeoutId)
@@ -57,21 +63,23 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
       parser.on("pdfParser_dataReady", (pdfData) => {
         clearTimeout(timeoutId)
         try {
-          console.log("📋 pdf2json raw data structure:", {
-            hasPages: !!(pdfData?.Pages || pdfData?.formImage?.Pages),
-            pagesCount: (pdfData?.Pages || pdfData?.formImage?.Pages)?.length || 0
-          })
-          
           const pages = pdfData?.Pages || pdfData?.formImage?.Pages
-          if (!pages || !Array.isArray(pages) || pages.length === 0) {
-            reject(new Error("No readable pages found in PDF"))
+          if (!pages || !Array.isArray(pages)) {
+            reject(new Error("No readable pages found"))
             return
           }
 
           const rawText = pages
-            .map(page => {
+            .map((page, pageIndex) => {
+              console.log(`📋 Processing page ${pageIndex + 1}...`)
               if (!page.Texts || !Array.isArray(page.Texts)) return ""
+              
               return page.Texts
+                .sort((a, b) => {
+                  // Sort by Y position (top to bottom), then X position (left to right)
+                  if (Math.abs(a.y - b.y) > 0.5) return a.y - b.y
+                  return a.x - b.x
+                })
                 .map(textItem => {
                   if (!textItem.R || !Array.isArray(textItem.R)) return ""
                   return textItem.R
@@ -82,15 +90,17 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
                         return r.T || ""
                       }
                     })
-                    .join(" ")
+                    .join("")
                 })
+                .filter(text => text.trim().length > 0)
                 .join(" ")
             })
-            .join("\n")
+            .filter(pageText => pageText.trim().length > 0)
+            .join("\n\n")
 
           console.log("📋 pdf2json extracted text:", {
             length: rawText.length,
-            preview: rawText.substring(0, 200)
+            preview: rawText.substring(0, 500)
           })
 
           resolve(rawText)
@@ -99,15 +109,12 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
         }
       })
 
-      // Parse the buffer directly
       parser.parseBuffer(buffer)
     })
 
-    if (parsed && parsed.trim().length > 50) {
+    if (parsed && parsed.trim().length > 20) {
       extractedText = parsed.trim()
       console.log("✅ pdf2json successful!")
-      console.log("📝 Extracted text length:", extractedText.length)
-      console.log("📝 Text preview:", extractedText.substring(0, 500))
       return cleanExtractedText(extractedText)
     }
     errors.push("pdf2json: insufficient text extracted")
@@ -116,38 +123,51 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
     console.error("❌ pdf2json failed:", error)
   }
 
-  // Method 3: Simple buffer text extraction (last resort)
+  // Method 3: Raw buffer extraction with better patterns
   try {
-    console.log("📋 Attempting buffer text extraction...")
-    const bufferText = buffer.toString('utf8')
-    const textMatch = bufferText.match(/\/Length\s+(\d+).*?stream\s*(.*?)\s*endstream/gs)
+    console.log("📋 Attempting advanced buffer extraction...")
+    const bufferText = buffer.toString('binary')
     
-    console.log("📋 Buffer extraction results:", {
-      hasMatches: !!textMatch,
-      matchCount: textMatch?.length || 0
+    // Multiple extraction patterns
+    const patterns = [
+      // Standard text objects
+      /BT\s*(.*?)\s*ET/gs,
+      // Text showing operators
+      /\((.*?)\)\s*Tj/g,
+      /\[(.*?)\]\s*TJ/g,
+      // Direct text in parentheses
+      /\(([^)]{3,})\)/g,
+    ]
+    
+    let combinedText = ""
+    patterns.forEach((pattern, index) => {
+      const matches = bufferText.match(pattern)
+      if (matches) {
+        console.log(`📋 Pattern ${index + 1} found ${matches.length} matches`)
+        const patternText = matches
+          .map(match => match.replace(/^[^(]*\(/, '').replace(/\)[^)]*$/, ''))
+          .join(' ')
+        combinedText += patternText + ' '
+      }
     })
     
-    if (textMatch) {
-      let combinedText = textMatch
-        .map(match => match.replace(/^.*?stream\s*/, '').replace(/\s*endstream.*$/, ''))
-        .join(' ')
-      
-      // Clean up the extracted text
-      combinedText = combinedText
-        .replace(/[^\x20-\x7E\s]/g, ' ') // Remove non-printable characters
-        .replace(/\s+/g, ' ')
-        .trim()
-      
-      console.log("📋 Buffer cleaned text:", {
-        length: combinedText.length,
-        preview: combinedText.substring(0, 200)
-      })
-      
-      if (combinedText.length > 50) {
-        extractedText = combinedText
-        console.log("✅ Buffer extraction successful!")
-        return cleanExtractedText(extractedText)
-      }
+    // Clean the extracted text
+    combinedText = combinedText
+      .replace(/\\[0-9]{3}/g, '') // Remove octal characters
+      .replace(/\\[rnt]/g, ' ') // Replace escaped characters
+      .replace(/[^\x20-\x7E]/g, ' ') // Keep only printable ASCII
+      .replace(/\s+/g, ' ')
+      .trim()
+    
+    console.log("📋 Buffer extraction results:", {
+      length: combinedText.length,
+      preview: combinedText.substring(0, 300)
+    })
+    
+    if (combinedText.length > 50) {
+      extractedText = combinedText
+      console.log("✅ Buffer extraction successful!")
+      return cleanExtractedText(extractedText)
     }
     errors.push("buffer extraction: insufficient text found")
   } catch (error) {
@@ -155,169 +175,117 @@ async function extractTextFromPDF(buffer: Buffer): Promise<string> {
     console.error("❌ Buffer extraction failed:", error)
   }
 
-  // Method 4: Binary pattern matching for common PDF text
-  try {
-    console.log("📋 Attempting binary pattern extraction...")
-    const binaryText = buffer.toString('binary')
-    const patterns = [
-      /BT\s*([^E]*?)\s*ET/g,  // Text objects
-      /Tj\s*([^T]*?)\s*TJ/g,  // Text showing
-      /\((.*?)\)/g,           // Parentheses enclosed text
-    ]
-    
-    let patternText = ""
-    patterns.forEach((pattern, index) => {
-      const matches = binaryText.match(pattern)
-      console.log(`📋 Pattern ${index + 1} matches:`, matches?.length || 0)
-      if (matches) {
-        patternText += matches.join(' ')
-      }
-    })
-    
-    console.log("📋 Pattern extraction results:", {
-      length: patternText.length,
-      preview: patternText.substring(0, 200)
-    })
-    
-    if (patternText.length > 50) {
-      extractedText = patternText
-        .replace(/[^\x20-\x7E\s]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-      console.log("✅ Pattern extraction successful!")
-      return cleanExtractedText(extractedText)
-    }
-    errors.push("pattern extraction: insufficient text found")
-  } catch (error) {
-    errors.push(`pattern extraction: ${error}`)
-    console.error("❌ Pattern extraction failed:", error)
-  }
-
-  // If all methods fail, provide detailed error information
   console.error("❌ All PDF extraction methods failed:", errors)
-  throw new Error(`Could not extract text from PDF. Attempted methods: ${errors.join('; ')}. The PDF might be scanned, password-protected, or use unsupported encoding.`)
+  throw new Error(`Could not extract text from PDF. This might be a scanned PDF, image-based, or password-protected. Try using an OCR tool first.`)
 }
 
-// Enhanced text cleaning function
+// Improved text cleaning
 function cleanExtractedText(text: string): string {
   if (!text || typeof text !== 'string') return ""
   
   const cleaned = text
-    // Remove control characters and special Unicode
-    .replace(/[\x00-\x1F\x7F-\x9F]/g, ' ')
-    // Normalize whitespace
-    .replace(/\s+/g, ' ')
-    // Remove most special characters but keep important ones
-    .replace(/[^\w\s@.,()\/\-:;'"]/g, ' ')
-    // Clean up multiple spaces
-    .replace(/\s+/g, ' ')
-    // Remove standalone single characters (usually artifacts)
+    // Fix common PDF encoding issues
+    .replace(/\u00A0/g, ' ') // Replace non-breaking spaces
+    .replace(/\u2022/g, '•') // Replace bullet points
+    .replace(/\u2013/g, '-') // Replace en dash
+    .replace(/\u2014/g, '--') // Replace em dash
+    .replace(/\u201C|\u201D/g, '"') // Replace smart quotes
+    .replace(/\u2018|\u2019/g, "'") // Replace smart apostrophes
+    
+    // Remove control characters but keep line breaks
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ')
+    
+    // Normalize line breaks and spaces
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+/g, ' ') // Multiple spaces/tabs to single space
+    .replace(/\n\s*\n\s*\n/g, '\n\n') // Multiple line breaks to double
+    
+    // Remove isolated single characters (PDF artifacts)
     .replace(/\s[a-zA-Z]\s/g, ' ')
-    // Remove empty parentheses and brackets
-    .replace(/\(\s*\)/g, ' ')
-    .replace(/\[\s*\]/g, ' ')
-    // Final cleanup
-    .trim()
+    .replace(/^\s*[a-zA-Z]\s+/gm, '') // Single chars at line start
+    
+    // Clean up formatting
+    .replace(/\s*\n\s*/g, '\n')
     .replace(/\s+/g, ' ')
+    .trim()
     
   console.log("🧹 Text cleaning results:", {
     originalLength: text.length,
     cleanedLength: cleaned.length,
-    cleanedPreview: cleaned.substring(0, 300)
+    hasContent: cleaned.length > 100
   })
   
   return cleaned
 }
 
-// Enhanced AI prompt with better structure
+// More focused AI prompt with chunking support
 function createEnhancedPrompt(extractedText: string): string {
-  // Preprocess text to focus on resume content
-  const preprocessedText = extractedText
-    .replace(/\s+/g, ' ')
-    .replace(/[^\w\s@.,()\/\-:;'"]/g, ' ')
-    .trim()
-    .substring(0, 8000) // Limit to prevent token overflow
+  // Chunk text if it's too long
+  const maxTextLength = 6000 // Conservative limit for better processing
+  const processedText = extractedText.length > maxTextLength 
+    ? extractedText.substring(0, maxTextLength) + "..."
+    : extractedText
   
-  console.log("🤖 Creating AI prompt with text:", {
+  console.log("🤖 Creating AI prompt:", {
     originalLength: extractedText.length,
-    preprocessedLength: preprocessedText.length,
-    preview: preprocessedText.substring(0, 500)
+    processedLength: processedText.length,
+    wasTruncated: extractedText.length > maxTextLength
   })
   
-  return `You are an expert resume parser AI. Extract structured information from this resume text and return ONLY a valid JSON object with ALL available information.
+  return `Parse this resume and extract structured information. Return ONLY valid JSON.
 
 RESUME TEXT:
-${preprocessedText}
+${processedText}
 
-CRITICAL INSTRUCTIONS:
-1. Extract ALL information present in the resume text
-2. Be thorough - don't miss any details
-3. For missing information, use meaningful defaults
-4. Return ONLY the JSON object, no explanations
-5. Ensure valid JSON formatting with proper quotes and commas
-6. Extract complete experience descriptions and responsibilities
-7. Include all projects with full details
-8. Capture all education information including coursework
-9. Find all contact information and social links
-10. Extract all skills, certifications, and achievements
-
-REQUIRED JSON STRUCTURE (extract ALL available data):
+Extract information and return JSON with this structure:
 {
-  "name": "Full name from resume",
-  "email": "Email address found",
-  "phone": "Phone number found",
-  "title": "Professional title or role",
-  "location": "Location/address found",
-  "summary": "Professional summary or objective",
-  "skills": ["ALL technical and soft skills found"],
-  "languages": ["All languages mentioned"],
-  "certifications": ["All certifications found"],
-  "achievements": ["All achievements and awards found"],
-  "hobbies": ["All hobbies and interests found"],
-  "socialLinks": {
-    "linkedin": "LinkedIn URL if found",
-    "github": "GitHub URL if found",
-    "portfolio": "Portfolio URL if found",
-    "twitter": "Twitter URL if found"
-  },
+  "name": "Full name",
+  "email": "email@domain.com", 
+  "phone": "phone number",
+  "title": "job title or role",
+  "location": "city, state/country",
+  "summary": "professional summary",
+  "skills": ["skill1", "skill2"],
   "experience": [
     {
-      "company": "Company name",
-      "position": "Job title",
-      "duration": "Employment period",
-      "description": "FULL job description",
-      "responsibilities": ["ALL responsibilities listed"]
+      "company": "Company Name",
+      "position": "Job Title", 
+      "duration": "Start - End dates",
+      "description": "What they did in this role",
+      "responsibilities": ["task1", "task2"]
     }
   ],
   "education": [
     {
-      "institution": "Institution name",
-      "degree": "Full degree name",
-      "year": "Year or duration",
-      "gpa": "GPA if mentioned",
-      "coursework": ["ALL relevant courses mentioned"]
+      "institution": "School Name",
+      "degree": "Degree Name",
+      "year": "Year or duration", 
+      "gpa": "GPA if mentioned"
     }
   ],
   "projects": [
     {
-      "name": "Project name",
-      "description": "FULL project description",
-      "technologies": ["ALL technologies used"],
-      "link": "Project URL if found",
-      "github": "GitHub URL if found",
-      "features": ["ALL features mentioned"]
+      "name": "Project Name",
+      "description": "What the project does",
+      "technologies": ["tech1", "tech2"],
+      "link": "project URL if any"
     }
   ],
-  "isFresher": false,
-  "fresherDetails": {
-    "internships": ["All internships"],
-    "academicProjects": ["All academic projects"],
-    "extracurriculars": ["All extracurricular activities"],
-    "coursework": ["All coursework mentioned"]
+  "certifications": ["cert1", "cert2"],
+  "languages": ["language1", "language2"],
+  "socialLinks": {
+    "linkedin": "LinkedIn URL",
+    "github": "GitHub URL", 
+    "portfolio": "Portfolio URL"
   }
 }
 
-IMPORTANT: Be thorough and extract ALL information. Don't abbreviate or summarize. Return the complete JSON object with all available details.`
+Rules:
+- Extract ALL information present
+- Use empty strings/arrays for missing data
+- Ensure valid JSON format
+- No explanations, just JSON`
 }
 
 export async function POST(request: NextRequest) {
@@ -333,14 +301,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "File must be a PDF" }, { status: 400 })
     }
 
-    // Check file size (10MB limit)
     if (file.size > 10 * 1024 * 1024) {
       return NextResponse.json({ error: "File size must be less than 10MB" }, { status: 400 })
     }
 
     console.log(`📄 Processing PDF: ${file.name} (${(file.size / 1024).toFixed(2)}KB)`)
 
-    // Convert PDF to text
+    // Extract text from PDF
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
     
@@ -348,156 +315,105 @@ export async function POST(request: NextRequest) {
     
     try {
       extractedText = await extractTextFromPDF(buffer)
-      console.log(`✅ Text extraction successful!`)
-      console.log(`📝 FULL EXTRACTED TEXT (${extractedText.length} chars):`)
-      console.log("=" * 50)
-      console.log(extractedText)
-      console.log("=" * 50)
+      console.log(`✅ Text extraction successful! Length: ${extractedText.length}`)
+      console.log(`📝 First 500 chars: ${extractedText.substring(0, 500)}`)
       
-      // Basic validation
       if (extractedText.length < 50) {
-        throw new Error("Extracted text is too short to be meaningful")
-      }
-      
-      // Check if text contains actual readable content
-      const readableChars = extractedText.replace(/\s/g, '').length
-      const alphaChars = (extractedText.match(/[a-zA-Z]/g) || []).length
-      
-      console.log("📊 Text quality analysis:", {
-        totalLength: extractedText.length,
-        readableChars,
-        alphaChars,
-        alphaRatio: (alphaChars / readableChars).toFixed(2)
-      })
-      
-      if (alphaChars < readableChars * 0.3) {
-        throw new Error("Extracted text appears to be corrupted or contains mostly non-readable characters")
+        throw new Error("Extracted text is too short - PDF might be image-based or corrupted")
       }
       
     } catch (pdfError) {
       console.error("❌ PDF parsing error:", pdfError)
       return NextResponse.json({ 
-        error: `Failed to extract text from PDF: ${pdfError.message}. Please try a different PDF or use manual entry.` 
+        error: `Failed to extract text from PDF: ${pdfError.message}. Try converting to a text-based PDF first.` 
       }, { status: 400 })
     }
 
-    // Generate AI prompt
+    // Process with AI
     const prompt = createEnhancedPrompt(extractedText)
     console.log("🤖 Sending to Groq AI...")
-    console.log("🤖 AI Prompt length:", prompt.length)
 
     try {
-      // Use the newer model instead of the deprecated one
       const { text } = await generateText({
-        model: groq("llama3-8b-8192"), // Updated model
+        model: groq("llama-3.1-70b-versatile"), // Better model for structured output
         prompt: prompt,
-        maxTokens: 4000,
-        temperature: 0.1,
-        maxRetries: 3,
-        abortSignal: AbortSignal.timeout(45000), // 45 second timeout
+        maxTokens: 2048,
+        temperature: 0,
+        maxRetries: 2,
+        abortSignal: AbortSignal.timeout(30000),
       })
 
       console.log("🤖 AI Response received!")
-      console.log("🤖 RAW AI RESPONSE:")
-      console.log("=" * 50)
-      console.log(text)
-      console.log("=" * 50)
+      console.log("🤖 Raw response length:", text.length)
 
-      // Enhanced JSON extraction and cleaning
-      let cleanedText = text.trim()
-
-      // Remove markdown formatting
-      cleanedText = cleanedText.replace(/```json\s*/g, "").replace(/```\s*$/g, "")
-      cleanedText = cleanedText.replace(/```/g, "")
-
-      // Find JSON boundaries
-      const jsonStart = cleanedText.indexOf("{")
-      const jsonEnd = cleanedText.lastIndexOf("}") + 1
-
-      if (jsonStart === -1 || jsonEnd <= jsonStart) {
-        throw new Error("No valid JSON found in AI response")
-      }
-
-      cleanedText = cleanedText.substring(jsonStart, jsonEnd)
-
-      console.log("🧹 Cleaned JSON text:")
-      console.log("=" * 50)
-      console.log(cleanedText)
-      console.log("=" * 50)
-
-      // Fix common JSON issues
-      cleanedText = cleanedText
-        .replace(/,\s*}/g, '}')
-        .replace(/,\s*]/g, ']')
-        .replace(/([{,]\s*)(\w+):/g, '$1"$2":')
-        .replace(/:\s*'([^']*)'/g, ': "$1"')
-
-      try {
-        const extractedData = JSON.parse(cleanedText)
-        console.log("✅ JSON parsed successfully!")
-        console.log("📊 EXTRACTED DATA STRUCTURE:")
-        console.log("=" * 50)
-        console.log(JSON.stringify(extractedData, null, 2))
-        console.log("=" * 50)
-        
-        // Validate and clean the extracted data
-        const userData = validateAndCleanUserData(extractedData)
-        
-        console.log("📊 FINAL USER DATA:")
-        console.log("=" * 50)
-        console.log(JSON.stringify(userData, null, 2))
-        console.log("=" * 50)
-        
-        console.log("✅ Final user data processed successfully!")
-        return NextResponse.json(userData)
-        
-      } catch (parseError) {
-        console.error("❌ JSON parsing failed:", parseError)
-        console.error("❌ Raw AI response:", text.substring(0, 500))
-        console.error("❌ Cleaned text:", cleanedText.substring(0, 500))
-
-        // Create fallback data
-        const fallbackData = createFallbackData(extractedText)
-        console.log("⚠️ Using fallback data extraction")
-        console.log("📊 FALLBACK DATA:")
-        console.log("=" * 50)
-        console.log(JSON.stringify(fallbackData, null, 2))
-        console.log("=" * 50)
-        return NextResponse.json(fallbackData)
-      }
+      // Parse AI response
+      const parsedData = parseAIResponse(text)
+      const userData = validateAndEnhanceData(parsedData, extractedText)
+      
+      console.log("✅ Final processing complete!")
+      return NextResponse.json(userData)
+      
     } catch (aiError) {
       console.error("❌ AI processing error:", aiError)
       
-      // Create fallback data
-      const fallbackData = createFallbackData(extractedText)
-      console.log("⚠️ Using fallback data due to AI error")
-      console.log("📊 FALLBACK DATA:")
-      console.log("=" * 50)
-      console.log(JSON.stringify(fallbackData, null, 2))
-      console.log("=" * 50)
+      // Try fallback parsing
+      const fallbackData = createSmartFallback(extractedText)
+      console.log("⚠️ Using fallback parsing")
       return NextResponse.json(fallbackData)
     }
 
   } catch (error) {
     console.error("❌ Unexpected error:", error)
     return NextResponse.json({ 
-      error: `An unexpected error occurred: ${error.message}` 
+      error: `Processing failed: ${error.message}` 
     }, { status: 500 })
   }
 }
 
-// Enhanced validation and cleaning with more thorough extraction
-function validateAndCleanUserData(data: any): any {
-  console.log("🔍 Validating and cleaning user data...")
+// Better AI response parsing
+function parseAIResponse(text: string): any {
+  let cleanedText = text.trim()
   
-  const cleaned = {
-    name: data.name && data.name !== "Unknown User" ? data.name : "Unknown User",
-    email: data.email && data.email !== "user@example.com" ? data.email : "user@example.com",
-    phone: data.phone && data.phone !== "+1 (555) 000-0000" ? data.phone : "+1 (555) 000-0000",
+  // Remove markdown formatting
+  cleanedText = cleanedText.replace(/```json\s*/gi, "").replace(/```\s*$/g, "")
+  cleanedText = cleanedText.replace(/```/g, "")
+  
+  // Find JSON boundaries
+  const jsonStart = cleanedText.indexOf("{")
+  const jsonEnd = cleanedText.lastIndexOf("}") + 1
+  
+  if (jsonStart === -1 || jsonEnd <= jsonStart) {
+    console.error("No JSON found in response")
+    throw new Error("Invalid AI response format")
+  }
+  
+  cleanedText = cleanedText.substring(jsonStart, jsonEnd)
+  
+  // Fix common JSON issues
+  cleanedText = cleanedText
+    .replace(/,(\s*[}\]])/g, '$1') // Remove trailing commas
+    .replace(/([{,]\s*)(\w+):/g, '$1"$2":') // Quote unquoted keys
+    .replace(/:\s*'([^']*)'/g, ': "$1"') // Single to double quotes
+  
+  try {
+    return JSON.parse(cleanedText)
+  } catch (e) {
+    console.error("JSON parse error:", e)
+    console.error("Cleaned text:", cleanedText.substring(0, 500))
+    throw new Error("Failed to parse AI response")
+  }
+}
+
+// Enhanced data validation and completion
+function validateAndEnhanceData(data: any, originalText: string): any {
+  const enhanced = {
+    name: data.name || extractName(originalText) || "Unknown User",
+    email: data.email || extractEmail(originalText) || "user@example.com", 
+    phone: data.phone || extractPhone(originalText) || "+1 (555) 000-0000",
     title: data.title || "Professional",
     location: data.location || "Location Not Specified",
-    summary: data.summary || "Dedicated professional with strong technical skills and experience.",
-    skills: Array.isArray(data.skills) ? data.skills.filter(Boolean) : [],
+    summary: data.summary || "Dedicated professional with relevant experience and skills.",
+    skills: Array.isArray(data.skills) ? data.skills.filter(Boolean) : extractSkills(originalText),
     languages: Array.isArray(data.languages) ? data.languages.filter(Boolean) : ["English"],
     certifications: Array.isArray(data.certifications) ? data.certifications.filter(Boolean) : [],
     achievements: Array.isArray(data.achievements) ? data.achievements.filter(Boolean) : [],
@@ -508,130 +424,78 @@ function validateAndCleanUserData(data: any): any {
       portfolio: data.socialLinks?.portfolio || "",
       twitter: data.socialLinks?.twitter || "",
     },
-    experience: Array.isArray(data.experience)
-      ? data.experience.map((exp: any) => ({
-          company: exp.company || "",
-          position: exp.position || "",
-          duration: exp.duration || "",
-          description: exp.description || "",
-          responsibilities: Array.isArray(exp.responsibilities) ? exp.responsibilities.filter(Boolean) : [],
-        })).filter((exp: any) => exp.company || exp.position)
-      : [],
-    education: Array.isArray(data.education)
-      ? data.education.map((edu: any) => ({
-          institution: edu.institution || "",
-          degree: edu.degree || "",
-          year: edu.year || "",
-          gpa: edu.gpa || "",
-          coursework: Array.isArray(edu.coursework) ? edu.coursework.filter(Boolean) : [],
-        })).filter((edu: any) => edu.institution || edu.degree)
-      : [],
-    projects: Array.isArray(data.projects)
-      ? data.projects.map((proj: any) => ({
-          name: proj.name || "",
-          description: proj.description || "",
-          technologies: Array.isArray(proj.technologies) ? proj.technologies.filter(Boolean) : [],
-          link: proj.link || "",
-          github: proj.github || "",
-          features: Array.isArray(proj.features) ? proj.features.filter(Boolean) : [],
-        })).filter((proj: any) => proj.name || proj.description)
-      : [],
-    isFresher: Boolean(data.isFresher),
+    experience: Array.isArray(data.experience) ? data.experience.filter((exp: any) => exp.company || exp.position) : [],
+    education: Array.isArray(data.education) ? data.education.filter((edu: any) => edu.institution || edu.degree) : [],
+    projects: Array.isArray(data.projects) ? data.projects.filter((proj: any) => proj.name || proj.description) : [],
+    isFresher: !data.experience || data.experience.length === 0,
     fresherDetails: {
-      internships: Array.isArray(data.fresherDetails?.internships) ? data.fresherDetails.internships.filter(Boolean) : [],
-      academicProjects: Array.isArray(data.fresherDetails?.academicProjects) ? data.fresherDetails.academicProjects.filter(Boolean) : [],
-      extracurriculars: Array.isArray(data.fresherDetails?.extracurriculars) ? data.fresherDetails.extracurriculars.filter(Boolean) : [],
-      coursework: Array.isArray(data.fresherDetails?.coursework) ? data.fresherDetails.coursework.filter(Boolean) : [],
+      internships: data.fresherDetails?.internships || [],
+      academicProjects: data.fresherDetails?.academicProjects || [],
+      extracurriculars: data.fresherDetails?.extracurriculars || [],
+      coursework: data.fresherDetails?.coursework || [],
     },
   }
   
-  console.log("🔍 Validation results:", {
-    hasName: cleaned.name !== "Unknown User",
-    hasEmail: cleaned.email !== "user@example.com",
-    hasPhone: cleaned.phone !== "+1 (555) 000-0000",
-    skillsCount: cleaned.skills.length,
-    experienceCount: cleaned.experience.length,
-    educationCount: cleaned.education.length,
-    projectsCount: cleaned.projects.length
-  })
-  
-  return cleaned
+  return enhanced
 }
 
-// Create fallback data using manual extraction
-function createFallbackData(extractedText: string): any {
-  console.log("🔄 Creating fallback data from extracted text")
-  
-  // Extract basic information using regex
-  const emailMatch = extractedText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)
-  const phoneMatch = extractedText.match(/[\+]?[1-9]?[\d\s\-\(\)\.]{7,15}/g)
-  
-  // Extract name (look for capitalized words at the beginning)
-  const nameMatch = extractedText.match(/^[A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+/m) || 
-                   extractedText.match(/[A-Z][a-zA-Z]+\s+[A-Z][a-zA-Z]+/g)
-  
-  // Extract skills (common tech keywords)
-  const skillKeywords = [
-    'JavaScript', 'Python', 'Java', 'React', 'Node.js', 'HTML', 'CSS', 'SQL', 'Git', 'AWS',
-    'Docker', 'MongoDB', 'TypeScript', 'Angular', 'Vue.js', 'PHP', 'C++', 'C#', 'Swift',
-    'Kotlin', 'Flutter', 'Django', 'Spring', 'Express', 'PostgreSQL', 'MySQL', 'Redis',
-    'Kubernetes', 'Jenkins', 'GraphQL', 'REST API', 'Microservices', 'DevOps', 'Linux',
-    'Windows', 'macOS', 'Agile', 'Scrum', 'JIRA', 'Confluence', 'Slack', 'Teams'
+// Regex-based extraction helpers
+function extractName(text: string): string | null {
+  const patterns = [
+    /^([A-Z][a-z]+ [A-Z][a-z]+)/m,
+    /([A-Z][a-z]+ [A-Z][a-z]+)(?=\s*\n|\s*[|\-]|\s*Contact)/i,
   ]
   
-  const foundSkills = skillKeywords.filter(skill => 
-    extractedText.toLowerCase().includes(skill.toLowerCase())
-  )
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (match) return match[1].trim()
+  }
+  return null
+}
+
+function extractEmail(text: string): string | null {
+  const match = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)
+  return match ? match[0] : null
+}
+
+function extractPhone(text: string): string | null {
+  const match = text.match(/[\+]?[1-9]?[\d\s\-\(\)\.]{7,15}/)
+  return match ? match[0].trim() : null
+}
+
+function extractSkills(text: string): string[] {
+  const skillKeywords = [
+    'JavaScript', 'TypeScript', 'Python', 'Java', 'React', 'Node.js', 'HTML', 'CSS', 
+    'SQL', 'Git', 'AWS', 'Docker', 'MongoDB', 'Angular', 'Vue.js', 'PHP', 'C++', 'C#'
+  ]
   
-  // Extract education info
-  const educationKeywords = ['University', 'College', 'Institute', 'School', 'Bachelor', 'Master', 'PhD', 'Degree']
-  const hasEducation = educationKeywords.some(keyword => 
-    extractedText.toLowerCase().includes(keyword.toLowerCase())
+  return skillKeywords.filter(skill => 
+    new RegExp(`\\b${skill}\\b`, 'i').test(text)
   )
-  
-  // Extract experience indicators
-  const experienceKeywords = ['Experience', 'Work', 'Employment', 'Position', 'Role', 'Company']
-  const hasExperience = experienceKeywords.some(keyword => 
-    extractedText.toLowerCase().includes(keyword.toLowerCase())
-  )
-  
+}
+
+// Smart fallback when AI fails
+function createSmartFallback(extractedText: string): any {
   return {
-    name: nameMatch ? (Array.isArray(nameMatch) ? nameMatch[0] : nameMatch) : "Unknown User",
-    email: emailMatch ? emailMatch[0] : "user@example.com",
-    phone: phoneMatch ? phoneMatch[0].replace(/\s+/g, ' ').trim() : "+1 (555) 000-0000",
+    name: extractName(extractedText) || "Unknown User",
+    email: extractEmail(extractedText) || "user@example.com",
+    phone: extractPhone(extractedText) || "+1 (555) 000-0000",
     title: "Professional",
-    location: "Location Not Specified",
-    summary: "Dedicated professional with strong technical skills and experience.",
-    skills: foundSkills.length > 0 ? foundSkills : ['JavaScript', 'HTML', 'CSS'],
+    location: "Location Not Specified", 
+    summary: "Professional with relevant experience and technical skills.",
+    skills: extractSkills(extractedText),
     languages: ["English"],
     certifications: [],
     achievements: [],
     hobbies: [],
-    socialLinks: {
-      linkedin: "",
-      github: "",
-      portfolio: "",
-      twitter: "",
-    },
-    experience: hasExperience ? [{
-      company: "Company Name",
-      position: "Position",
-      duration: "Duration",
-      description: "Description extracted from resume",
-      responsibilities: ["Responsibilities extracted from resume"]
-    }] : [],
-    education: hasEducation ? [{
-      institution: "Institution Name",
-      degree: "Degree",
-      year: "Year",
-      gpa: "",
-      coursework: []
-    }] : [],
+    socialLinks: { linkedin: "", github: "", portfolio: "", twitter: "" },
+    experience: [],
+    education: [],
     projects: [],
-    isFresher: !hasExperience,
+    isFresher: true,
     fresherDetails: {
       internships: [],
-      academicProjects: [],
+      academicProjects: [], 
       extracurriculars: [],
       coursework: [],
     },
