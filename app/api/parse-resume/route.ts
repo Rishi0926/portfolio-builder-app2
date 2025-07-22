@@ -466,12 +466,25 @@ function extractPhone(text: string): string | null {
 function extractSkills(text: string): string[] {
   const skillKeywords = [
     'JavaScript', 'TypeScript', 'Python', 'Java', 'React', 'Node.js', 'HTML', 'CSS', 
+    'SQL', 'Git', 'AWS', 'Docker', 'MongoDB', 'Angular', 'Vue.js', 'PHP', 'C++', 'C#',
+    'Swift', 'Kotlin', 'Flutter', 'Django', 'Spring', 'Express', 'PostgreSQL', 'MySQL',
+    'Redis', 'Kubernetes', 'Jenkins', 'GraphQL', 'REST API', 'Linux', 'Windows'
+  ]
+  
+  return skillKeywords.filter(skill => {
+    // Escape special regex characters
+    const escapedSkill = skill.replace(/[.*+?^${}()|[\]\\]/g, '\\function extractSkills(text: string): string[] {
+  const skillKeywords = [
+    'JavaScript', 'TypeScript', 'Python', 'Java', 'React', 'Node.js', 'HTML', 'CSS', 
     'SQL', 'Git', 'AWS', 'Docker', 'MongoDB', 'Angular', 'Vue.js', 'PHP', 'C++', 'C#'
   ]
   
   return skillKeywords.filter(skill => 
     new RegExp(`\\b${skill}\\b`, 'i').test(text)
   )
+}')
+    return new RegExp(`\\b${escapedSkill}\\b`, 'i').test(text)
+  })
 }
 
 // Smart fallback when AI fails
