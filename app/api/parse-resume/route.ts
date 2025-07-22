@@ -389,7 +389,7 @@ export async function POST(request: NextRequest) {
     try {
       // Use the newer model instead of the deprecated one
       const { text } = await generateText({
-        model: groq("llama3-70b-8192"), // Updated model
+        model: groq("compound-beta-mini"), // Updated model
         prompt: prompt,
         maxTokens: 4000,
         temperature: 0.1,
